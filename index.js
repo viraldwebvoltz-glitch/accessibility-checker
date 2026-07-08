@@ -15,7 +15,7 @@ const PORT = process.env.PORT || 3000;
 const REPORTS_DIR = path.join(__dirname, "reports");
 const MAX_CRAWL_PAGES = 20;
 
-let browser; // single shared browser instance
+let browser;
 
 // ---------- SSRF protection ----------
 async function isUrlSafe(rawUrl) {
@@ -49,7 +49,6 @@ async function isUrlSafe(rawUrl) {
 }
 
 // ---------- URL normalisation ----------
-// Returns true for locale-prefixed paths like /fr/, /de/, /es/ etc.
 function isLocaleUrl(rawUrl) {
   try {
     const { pathname } = new URL(rawUrl);
@@ -62,7 +61,7 @@ function isLocaleUrl(rawUrl) {
 function normalizePageUrl(rawUrl) {
   try {
     const u = new URL(rawUrl);
-    u.hash = ""; // strip fragment — same content, different anchor
+    u.hash = "";
     let str = u.toString();
     if (u.pathname.length > 1 && str.endsWith("/")) str = str.slice(0, -1);
     return str;
@@ -87,120 +86,164 @@ function cleanupOldReports() {
   }
 }
 
+// ---------- Page auditor ----------
+// Opens a page, runs axe + custom rules, optionally collects same-origin links.
+// Returns { pageResult, finalUrl, links } or null on failure.
+async function auditPage(url, serializedChecks, collectLinks = false) {
+  let page;
+  let netCapture;
+  const consoleLogs = [];
+
+  try {
+    page = await browser.newPage();
+    await page.setViewport({ width: 1280, height: 800 });
+
+    netCapture = await attachNetworkCapture(page);
+
+    page.on("console", (msg) => {
+      consoleLogs.push({ type: msg.type(), text: msg.text(), location: msg.location() });
+    });
+    page.on("pageerror", (err) => {
+      consoleLogs.push({ type: "pageerror", text: err.message, location: null });
+    });
+
+    let response;
+    try {
+      response = await page.goto(url, {
+        waitUntil: ["domcontentloaded", "networkidle2"],
+        timeout: 60000,
+      });
+    } catch (navError) {
+      console.warn(`Skipping ${url}: ${navError.message}`);
+      return null;
+    }
+
+    const finalUrl = page.url();
+    if (!response || finalUrl === "about:blank") return null;
+    if (!response.ok() && response.status() >= 400) return null;
+
+    await page.evaluate(axeSource);
+
+    await page.evaluate(
+      (checks, rules) => {
+        const reconstructedChecks = checks.map((check) => ({
+          ...check,
+          // eslint-disable-next-line no-new-func
+          evaluate: new Function("return (" + check.evaluate + ").apply(this, arguments);"),
+        }));
+        axe.configure({ checks: reconstructedChecks, rules });
+      },
+      serializedChecks,
+      customRules
+    );
+
+    const results = await page.evaluate(async () => axe.run());
+    const networkRecords = netCapture.getRecords();
+    const networkSummary = netCapture.getSummary(networkRecords);
+
+    let links = [];
+    if (collectLinks) {
+      // Use the actual post-redirect origin so http→https redirects don't drop links.
+      const actualOrigin = new URL(finalUrl).origin;
+      links = await page.evaluate((origin) => {
+        const hrefs = new Set();
+        document.querySelectorAll("a[href]").forEach((a) => {
+          try {
+            const u = new URL(a.href);
+            if (u.origin === origin && !a.href.includes("#")) hrefs.add(u.toString());
+          } catch {}
+        });
+        document.querySelectorAll("form[action]").forEach((f) => {
+          if (!f.method || f.method.toLowerCase() === "get") {
+            try {
+              const u = new URL(f.action);
+              if (u.origin === origin) hrefs.add(u.toString());
+            } catch {}
+          }
+        });
+        return Array.from(hrefs);
+      }, actualOrigin);
+    }
+
+    return {
+      pageResult: {
+        url,
+        finalUrl,
+        accessibility: results,
+        network: { summary: networkSummary, requests: networkRecords },
+        console: consoleLogs,
+      },
+      finalUrl,
+      links,
+    };
+  } catch (pageError) {
+    console.warn(`Error on ${url}: ${pageError.message}`);
+    return null;
+  } finally {
+    if (netCapture) await netCapture.detach();
+    if (page) await page.close();
+  }
+}
+
 // ---------- Routes ----------
+// Accepts one or more URLs via repeated query params: ?url=url1&url=url2
+// Multiple URLs → audit each directly, no subpage crawling, single combined report.
+// Single URL  → crawl subpages up to maxPages, single combined report.
 app.get("/audit", async (req, res) => {
-  const url = req.query.url;
+  const rawUrl = req.query.url;
   const maxPages = Math.min(Math.max(parseInt(req.query.maxPages) || MAX_CRAWL_PAGES, 1), 50);
 
-  if (!url) {
+  if (!rawUrl) {
     return res.status(400).json({ success: false, message: "Please provide a URL" });
   }
 
-  let baseOrigin;
-  try {
-    baseOrigin = new URL(url).origin;
-  } catch {
-    return res.status(400).json({ success: false, message: "Invalid URL provided" });
+  const urls = Array.isArray(rawUrl) ? rawUrl : [rawUrl];
+
+  console.log(`Received audit request for ${urls.length} URL(s):`, urls);
+
+  const multiMode = urls.length > 1;
+
+  for (const u of urls) {
+    if (!(await isUrlSafe(u))) {
+      return res.status(400).json({ success: false, message: `Invalid or unsafe URL: ${u}` });
+    }
   }
 
-  // Pre-serialise custom check functions once — functions can't cross the
-  // Node→browser boundary via structured clone so we stringify + reconstruct.
   const serializedChecks = customChecks.map((check) => ({
     ...check,
     evaluate: check.evaluate.toString(),
   }));
 
-  const visited = new Set();
-  const queue = [url];
   const pageResults = [];
 
   try {
-    while (queue.length > 0 && pageResults.length < maxPages) {
-      const currentUrl = queue.shift();
-      const normalizedUrl = normalizePageUrl(currentUrl);
+    if (multiMode) {
+      // Audit each provided URL directly — no subpage crawling
+      for (const url of urls) {
+        const result = await auditPage(url, serializedChecks);
+        if (result) pageResults.push(result.pageResult);
+      }
+    } else {
+      // Single URL mode: collect links from homepage and crawl subpages
+      const url = urls[0];
+      const visited = new Set();
+      const queue = [url];
 
-      if (visited.has(normalizedUrl)) continue;
-      visited.add(normalizedUrl);
+      while (queue.length > 0 && pageResults.length < maxPages) {
+        const currentUrl = queue.shift();
+        const normalizedUrl = normalizePageUrl(currentUrl);
 
-      let page;
-      let netCapture;
-      const consoleLogs = [];
+        if (visited.has(normalizedUrl)) continue;
+        visited.add(normalizedUrl);
 
-      try {
-        page = await browser.newPage();
-        await page.setViewport({ width: 1280, height: 800 });
+        // Collect links only from the first successfully audited page
+        const isFirstPage = pageResults.length === 0;
+        const result = await auditPage(currentUrl, serializedChecks, isFirstPage);
+        if (!result) continue;
 
-        netCapture = await attachNetworkCapture(page);
-
-        page.on("console", (msg) => {
-          consoleLogs.push({ type: msg.type(), text: msg.text(), location: msg.location() });
-        });
-        page.on("pageerror", (err) => {
-          consoleLogs.push({ type: "pageerror", text: err.message, location: null });
-        });
-
-        let response;
-        try {
-          response = await page.goto(currentUrl, {
-            waitUntil: ["domcontentloaded", "networkidle2"],
-            timeout: 60000,
-          });
-        } catch (navError) {
-          console.warn(`Skipping ${currentUrl}: ${navError.message}`);
-          continue;
-        }
-
-        const finalUrl = page.url();
-        if (!response || finalUrl === "about:blank") continue;
-        if (!response.ok() && response.status() >= 400) continue;
-
-        // Re-anchor baseOrigin to the landing page's actual origin so that
-        // http→https or non-www→www redirects don't silently drop all links.
-        if (pageResults.length === 0) {
-          try { baseOrigin = new URL(finalUrl).origin; } catch {}
-        }
-
-        await page.evaluate(axeSource);
-
-        await page.evaluate(
-          (checks, rules) => {
-            const reconstructedChecks = checks.map((check) => ({
-              ...check,
-              // eslint-disable-next-line no-new-func
-              evaluate: new Function("return (" + check.evaluate + ").apply(this, arguments);"),
-            }));
-            axe.configure({ checks: reconstructedChecks, rules });
-          },
-          serializedChecks,
-          customRules
-        );
-
-        const results = await page.evaluate(async () => axe.run());
-
-        // Only collect links from the homepage (first page) — no recursive crawl.
-        // Sub-pages' links are ignored so we audit homepage + its direct children only.
-        if (pageResults.length === 0) {
-          const newLinks = await page.evaluate((origin) => {
-            const hrefs = new Set();
-            document.querySelectorAll("a[href]").forEach((a) => {
-              try {
-                const u = new URL(a.href);
-                if (u.origin === origin && !a.href.includes("#")) hrefs.add(u.toString());
-              } catch {}
-            });
-            document.querySelectorAll("form[action]").forEach((f) => {
-              if (!f.method || f.method.toLowerCase() === "get") {
-                try {
-                  const u = new URL(f.action);
-                  if (u.origin === origin) hrefs.add(u.toString());
-                } catch {}
-              }
-            });
-            return Array.from(hrefs);
-          }, baseOrigin);
-
-          for (const link of newLinks) {
-            if (isLocaleUrl(link)) continue; // skip /fr/, /de/, /es/ etc. locale variants
+        if (isFirstPage) {
+          for (const link of result.links) {
+            if (isLocaleUrl(link)) continue;
             const norm = normalizePageUrl(link);
             if (!visited.has(norm) && !queue.some((q) => normalizePageUrl(q) === norm)) {
               queue.push(link);
@@ -208,22 +251,7 @@ app.get("/audit", async (req, res) => {
           }
         }
 
-        const networkRecords = netCapture.getRecords();
-        const networkSummary = netCapture.getSummary(networkRecords);
-
-        pageResults.push({
-          url: currentUrl,
-          finalUrl,
-          accessibility: results,
-          network: { summary: networkSummary, requests: networkRecords },
-          console: consoleLogs,
-        });
-
-      } catch (pageError) {
-        console.warn(`Error on ${currentUrl}: ${pageError.message}`);
-      } finally {
-        if (netCapture) await netCapture.detach();
-        if (page) await page.close();
+        pageResults.push(result.pageResult);
       }
     }
 
@@ -231,19 +259,39 @@ app.get("/audit", async (req, res) => {
       return res.status(400).json({
         success: false,
         message:
-          "Failed to load the provided URL. The site may be blocking automated browsers or redirecting unexpectedly.",
+          "Failed to load the provided URL(s). The site may be blocking automated browsers or redirecting unexpectedly.",
       });
     }
 
     fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
     const timestamp = Date.now();
-    const domain = new URL(url).hostname.replace(/^www\./, "");
-    const jsonFilename = `${domain}.json`;
-    const htmlFilename = `${domain}.html`;
+    let reportName;
+    if (multiMode) {
+      const domains = [
+        ...new Set(
+          urls.map((u) => {
+            try {
+              return new URL(u).hostname.replace(/^www\./, "");
+            } catch {
+              return "unknown";
+            }
+          })
+        ),
+      ];
+      reportName =
+        domains.length <= 2
+          ? domains.join("+")
+          : `${domains[0]}+${domains.length - 1}more`;
+    } else {
+      reportName = new URL(urls[0]).hostname.replace(/^www\./, "");
+    }
+
+    const jsonFilename = `${reportName}.json`;
+    const htmlFilename = `${reportName}.html`;
 
     const combinedReport = {
-      requestedUrl: url,
+      requestedUrl: multiMode ? urls : urls[0],
       timestamp,
       pages: pageResults,
     };
@@ -284,7 +332,6 @@ app.get("/health", (req, res) => {
   res.json({ success: true, status: "ok" });
 });
 
-// Serve generated reports as static files
 app.use("/reports", express.static(REPORTS_DIR));
 
 // ---------- Startup / shutdown ----------
@@ -342,7 +389,7 @@ async function start() {
     ],
   });
 
-  setInterval(cleanupOldReports, 60 * 60 * 1000); // hourly
+  setInterval(cleanupOldReports, 60 * 60 * 1000);
 
   app.listen(PORT, () => {
     console.log(`Audit server listening on port ${PORT}`);
