@@ -17,6 +17,20 @@ const MAX_CRAWL_PAGES = 20;
 
 let browser;
 
+function getChromeExecutablePath() {
+  const candidates = [
+    process.env.CHROME_BIN,
+    process.env.CHROMIUM_BIN,
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+    "/usr/bin/google-chrome",
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+  ];
+
+  return candidates.find((candidate) => Boolean(candidate) && fs.existsSync(candidate));
+}
+
 // ---------- SSRF protection ----------
 async function isUrlSafe(rawUrl) {
   let parsed;
@@ -338,8 +352,11 @@ app.use("/reports", express.static(REPORTS_DIR));
 async function start() {
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
 
+  const chromeExecutablePath = getChromeExecutablePath();
+
   browser = await puppeteer.launch({
     headless: true,
+    executablePath: chromeExecutablePath,
     ignoreHTTPSErrors: true,
     args: [
       "--headless=new",
