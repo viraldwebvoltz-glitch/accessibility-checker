@@ -4,11 +4,13 @@ const path = require("path");
 const { URL } = require("url");
 const dns = require("dns").promises;
 const net = require("net");
+const { spawn } = require("child_process");
 const puppeteer = require("puppeteer");
 const axeSource = require("axe-core").source;
 const { buildHtmlReport } = require("./reportTemplate");
 const { attachNetworkCapture } = require("./networkCapture");
 const { customChecks, customRules, CUSTOM_RULE_IDS } = require("./customAxeRules");
+const { renderHomePage } = require("./views/home");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,6 +31,32 @@ function getChromeExecutablePath() {
   ];
 
   return candidates.find((candidate) => Boolean(candidate) && fs.existsSync(candidate));
+}
+
+// Wraps text in an OSC 8 escape sequence so terminals that support it (iTerm2,
+// VS Code, Terminal.app, etc.) render it as a clickable hyperlink.
+function terminalLink(text, url) {
+  return `]8;;${url}\\${text}]8;;\\`;
+}
+
+function openInChrome(url) {
+  const platform = process.platform;
+  const attempts =
+    platform === "darwin"
+      ? [["open", ["-a", "Google Chrome", url]], ["open", [url]]]
+      : platform === "win32"
+      ? [["cmd", ["/c", "start", "chrome", url]], ["cmd", ["/c", "start", "", url]]]
+      : [["google-chrome", [url]], ["xdg-open", [url]]];
+
+  const tryNext = (index) => {
+    if (index >= attempts.length) return;
+    const [command, args] = attempts[index];
+    const child = spawn(command, args, { stdio: "ignore", detached: true });
+    child.on("error", () => tryNext(index + 1));
+    child.unref();
+  };
+
+  tryNext(0);
 }
 
 // ---------- SSRF protection ----------
@@ -200,9 +228,14 @@ async function auditPage(url, serializedChecks, collectLinks = false) {
 }
 
 // ---------- Routes ----------
+app.get("/", (req, res) => {
+  res.type("html").send(renderHomePage());
+});
+
 // Accepts one or more URLs via repeated query params: ?url=url1&url=url2
 // Multiple URLs → audit each directly, no subpage crawling, single combined report.
-// Single URL  → crawl subpages up to maxPages, single combined report.
+// Single URL  → ?crawl=true crawls subpages up to maxPages, ?crawl=false audits just that page.
+//               (crawl defaults to true when omitted, for backwards compatibility.)
 app.get("/audit", async (req, res) => {
   const rawUrl = req.query.url;
   const maxPages = Math.min(Math.max(parseInt(req.query.maxPages) || MAX_CRAWL_PAGES, 1), 50);
@@ -216,6 +249,12 @@ app.get("/audit", async (req, res) => {
   console.log(`Received audit request for ${urls.length} URL(s):`, urls);
 
   const multiMode = urls.length > 1;
+  const crawlParam = req.query.crawl;
+  const shouldCrawl = multiMode
+    ? false
+    : crawlParam === undefined
+    ? true
+    : ["true", "1", "on"].includes(String(crawlParam).toLowerCase());
 
   for (const u of urls) {
     if (!(await isUrlSafe(u))) {
@@ -237,7 +276,7 @@ app.get("/audit", async (req, res) => {
         const result = await auditPage(url, serializedChecks);
         if (result) pageResults.push(result.pageResult);
       }
-    } else {
+    } else if (shouldCrawl) {
       // Single URL mode: collect links from homepage and crawl subpages
       const url = urls[0];
       const visited = new Set();
@@ -267,6 +306,10 @@ app.get("/audit", async (req, res) => {
 
         pageResults.push(result.pageResult);
       }
+    } else {
+      // Single URL, crawling disabled: audit just that page
+      const result = await auditPage(urls[0], serializedChecks);
+      if (result) pageResults.push(result.pageResult);
     }
 
     if (pageResults.length === 0) {
@@ -409,7 +452,12 @@ async function start() {
   setInterval(cleanupOldReports, 60 * 60 * 1000);
 
   app.listen(PORT, () => {
-    console.log(`Audit server listening on port ${PORT}`);
+    const url = `http://localhost:${PORT}`;
+    console.log(`Accessibility Checker running at ${terminalLink(url, url)}`);
+
+    const autoOpenDisabled =
+      process.env.NODE_ENV === "production" || ["false", "0"].includes(process.env.AUTO_OPEN_BROWSER);
+    if (!autoOpenDisabled) openInChrome(url);
   });
 }
 
