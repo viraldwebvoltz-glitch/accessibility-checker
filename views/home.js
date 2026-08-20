@@ -175,6 +175,17 @@ function renderHomePage() {
   <div class="card error-panel" id="errorPanel" hidden role="alert" tabindex="-1">
     <p id="errorText"></p>
   </div>
+
+  <div class="card" id="manualScanPanel" hidden tabindex="-1">
+    <p id="manualScanIntro" style="margin-top:0">This site's bot-protection blocks automated browsers, including ours. You can still scan it using your own browser session, which the site already trusts:</p>
+    <ol style="padding-left:1.2rem;font-size:.9rem;color:var(--text)">
+      <li>Open the site in a normal browser tab and solve any challenge shown, as you normally would.</li>
+      <li>Open DevTools (Cmd+Option+I or F12) and go to the <strong>Console</strong> tab.</li>
+      <li>Paste the snippet below and press Enter. A report will open automatically when the scan finishes.</li>
+    </ol>
+    <pre id="manualScanSnippet" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:.75rem;font-family:var(--mono);font-size:.8rem;overflow-x:auto;white-space:pre-wrap;word-break:break-all"></pre>
+    <button type="button" class="btn-secondary" id="copySnippetBtn">Copy snippet</button>
+  </div>
 </main>
 
 <footer>
@@ -203,6 +214,10 @@ function renderHomePage() {
   var resultPanel = document.getElementById('resultPanel');
   var errorPanel = document.getElementById('errorPanel');
   var errorText = document.getElementById('errorText');
+  var manualScanPanel = document.getElementById('manualScanPanel');
+  var manualScanIntro = document.getElementById('manualScanIntro');
+  var manualScanSnippet = document.getElementById('manualScanSnippet');
+  var copySnippetBtn = document.getElementById('copySnippetBtn');
   var statGrid = document.getElementById('statGrid');
   var viewReportLink = document.getElementById('viewReportLink');
   var downloadReportLink = document.getElementById('downloadReportLink');
@@ -311,6 +326,7 @@ function renderHomePage() {
     isScanning = true;
     resultPanel.hidden = true;
     errorPanel.hidden = true;
+    manualScanPanel.hidden = true;
     scanPanel.hidden = false;
     setFormDisabled(true);
     startStatusRotation();
@@ -325,12 +341,16 @@ function renderHomePage() {
       .then(function(res){ return res.json().then(function(data){ return { ok: res.ok, data: data }; }); })
       .then(function(result){
         if (!result.ok || !result.data.success) {
-          throw new Error(result.data && result.data.message ? result.data.message : 'The scan failed. Please try again.');
+          var err = new Error(result.data && result.data.message ? result.data.message : 'The scan failed. Please try again.');
+          err.failures = result.data && result.data.failures;
+          throw err;
         }
         showResult(result.data);
       })
       .catch(function(err){
         showError(err.message || 'Something went wrong while scanning. Please try again.');
+        var botBlocked = (err.failures || []).filter(function(f){ return f.reason === 'bot-challenge'; });
+        if (botBlocked.length) showManualScanFallback(botBlocked.map(function(f){ return f.url; }));
       })
       .finally(function(){
         isScanning = false;
@@ -358,6 +378,13 @@ function renderHomePage() {
     downloadJsonLink.href = data.reportJson;
     resultPanel.hidden = false;
     resultPanel.focus();
+
+    // Some of the submitted URLs may still have failed (e.g. bot-blocked)
+    // even though this report covers the ones that succeeded.
+    var botBlocked = (data.failures || []).filter(function(f){ return f.reason === 'bot-challenge'; });
+    if (botBlocked.length) {
+      showManualScanFallback(botBlocked.map(function(f){ return f.url; }));
+    }
   }
 
   function showError(message){
@@ -365,6 +392,23 @@ function renderHomePage() {
     errorPanel.hidden = false;
     errorPanel.focus();
   }
+
+  function showManualScanFallback(urls){
+    var snippet = "fetch('" + location.origin + "/manual-scan/bundle.js').then(function(r){return r.text();}).then(eval);";
+    manualScanSnippet.textContent = snippet;
+    manualScanIntro.textContent = urls && urls.length
+      ? "These site(s) couldn't be scanned automatically: " + urls.join(', ') + ". Their bot-protection blocks automated browsers, including ours. You can still scan them using your own browser session, which the site already trusts:"
+      : "This site's bot-protection blocks automated browsers, including ours. You can still scan it using your own browser session, which the site already trusts:";
+    manualScanPanel.hidden = false;
+  }
+
+  copySnippetBtn.addEventListener('click', function(){
+    navigator.clipboard.writeText(manualScanSnippet.textContent).then(function(){
+      var original = copySnippetBtn.textContent;
+      copySnippetBtn.textContent = 'Copied!';
+      setTimeout(function(){ copySnippetBtn.textContent = original; }, 1500);
+    });
+  });
 })();
 </script>
 </body>

@@ -5,7 +5,9 @@ const { URL } = require("url");
 const dns = require("dns").promises;
 const net = require("net");
 const { spawn } = require("child_process");
-const puppeteer = require("puppeteer");
+const puppeteer = require("puppeteer-extra");
+const StealthPlugin = require("puppeteer-extra-plugin-stealth");
+puppeteer.use(StealthPlugin());
 const axeSource = require("axe-core").source;
 const { buildHtmlReport } = require("./reportTemplate");
 const { attachNetworkCapture } = require("./networkCapture");
@@ -16,6 +18,17 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const REPORTS_DIR = path.join(__dirname, "reports");
 const MAX_CRAWL_PAGES = 20;
+// The public URL this server is reachable at — needed so the manual-scan
+// bundle (loaded from an arbitrary third-party site) knows where to fetch
+// axe-core from and where to POST results back to. Behind a reverse proxy
+// or CDN, req.protocol/req.get("host") can be wrong unless this is set
+// explicitly (e.g. PUBLIC_BASE_URL=https://checker.example.com).
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "") || null;
+
+// Trust X-Forwarded-* headers from a reverse proxy/load balancer so
+// req.protocol reflects the real public scheme (https) instead of the
+// scheme the app is actually listening on (usually plain http internally).
+app.set("trust proxy", true);
 
 let browser;
 
@@ -128,9 +141,118 @@ function cleanupOldReports() {
   }
 }
 
+// ---------- Report writer ----------
+// Shared by the automated /audit route and the manual bookmarklet endpoint.
+function saveReport(pageResults, requestedUrl) {
+  fs.mkdirSync(REPORTS_DIR, { recursive: true });
+
+  const timestamp = Date.now();
+  const multiMode = Array.isArray(requestedUrl);
+  let reportName;
+  if (multiMode) {
+    const domains = [
+      ...new Set(
+        requestedUrl.map((u) => {
+          try {
+            return new URL(u).hostname.replace(/^www\./, "");
+          } catch {
+            return "unknown";
+          }
+        })
+      ),
+    ];
+    reportName = domains.length <= 2 ? domains.join("+") : `${domains[0]}+${domains.length - 1}more`;
+  } else {
+    reportName = new URL(requestedUrl).hostname.replace(/^www\./, "");
+  }
+
+  const jsonFilename = `${reportName}.json`;
+  const htmlFilename = `${reportName}.html`;
+
+  const combinedReport = { requestedUrl, timestamp, pages: pageResults };
+
+  fs.writeFileSync(path.join(REPORTS_DIR, jsonFilename), JSON.stringify(combinedReport, null, 2));
+
+  const html = buildHtmlReport(combinedReport, CUSTOM_RULE_IDS);
+  fs.writeFileSync(path.join(REPORTS_DIR, htmlFilename), html);
+
+  const totalViolations = pageResults.reduce((sum, p) => sum + (p.accessibility.violations || []).length, 0);
+  const totalPasses = pageResults.reduce((sum, p) => sum + (p.accessibility.passes || []).length, 0);
+  const customRuleIdSet = new Set(customRules.map((r) => r.id));
+  const totalCustom = pageResults.reduce(
+    (sum, p) => sum + (p.accessibility.violations || []).filter((v) => customRuleIdSet.has(v.id)).length,
+    0
+  );
+
+  return {
+    pagesScanned: pageResults.length,
+    violations: totalViolations,
+    customRuleViolations: totalCustom,
+    passes: totalPasses,
+    report: `/reports/${htmlFilename}`,
+    reportJson: `/reports/${jsonFilename}`,
+  };
+}
+
+// ---------- Bot / WAF challenge detection ----------
+// Some sites (Cloudflare, Akamai, etc.) show an interstitial JS/CAPTCHA
+// challenge to visitors that look automated instead of the real page.
+const REALISTIC_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36";
+
+const CHALLENGE_TEXT_PATTERNS = [
+  /Just a moment/i,
+  /Attention Required! \| Cloudflare/i,
+  /Checking your browser before accessing/i,
+  /Enable JavaScript and cookies to continue/i,
+  /Verify you are human/i,
+  /cdn-cgi\/challenge-platform/i,
+];
+
+async function detectBotChallenge(page, response) {
+  const headers = response.headers();
+  const server = headers["server"] || "";
+  const vendor = /cloudflare/i.test(server) ? "Cloudflare" : "the site's bot-protection service";
+
+  if (headers["cf-mitigated"]) return vendor;
+
+  let text = "";
+  try {
+    const title = await page.title();
+    const bodySnippet = await page.evaluate(() => document.body?.innerText?.slice(0, 500) || "");
+    text = `${title} ${bodySnippet}`;
+  } catch {
+    // page may not have a usable DOM yet; fall through to status check below
+  }
+
+  if (CHALLENGE_TEXT_PATTERNS.some((p) => p.test(text))) return vendor;
+  if (response.status() === 403 && /cloudflare/i.test(server)) return vendor;
+
+  return null;
+}
+
+// Cloudflare's JS/managed challenge typically clears itself client-side
+// within a few seconds once the browser's fingerprint passes inspection.
+async function waitForChallengeClear(page, timeoutMs = 8000) {
+  try {
+    await page.waitForFunction(
+      (patterns) => {
+        const text = document.title + " " + (document.body?.innerText?.slice(0, 500) || "");
+        return !patterns.some((p) => new RegExp(p, "i").test(text));
+      },
+      { timeout: timeoutMs, polling: 500 },
+      CHALLENGE_TEXT_PATTERNS.map((p) => p.source)
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ---------- Page auditor ----------
 // Opens a page, runs axe + custom rules, optionally collects same-origin links.
-// Returns { pageResult, finalUrl, links } or null on failure.
+// Returns { pageResult, finalUrl, links } on success, or
+// { failed: true, reason, ... } on failure.
 async function auditPage(url, serializedChecks, collectLinks = false) {
   let page;
   let netCapture;
@@ -138,6 +260,7 @@ async function auditPage(url, serializedChecks, collectLinks = false) {
 
   try {
     page = await browser.newPage();
+    await page.setUserAgent(REALISTIC_USER_AGENT);
     await page.setViewport({ width: 1280, height: 800 });
 
     netCapture = await attachNetworkCapture(page);
@@ -157,12 +280,26 @@ async function auditPage(url, serializedChecks, collectLinks = false) {
       });
     } catch (navError) {
       console.warn(`Skipping ${url}: ${navError.message}`);
-      return null;
+      return { failed: true, reason: "navigation-error", detail: navError.message, url };
     }
 
-    const finalUrl = page.url();
-    if (!response || finalUrl === "about:blank") return null;
-    if (!response.ok() && response.status() >= 400) return null;
+    let finalUrl = page.url();
+    if (!response || finalUrl === "about:blank") {
+      return { failed: true, reason: "no-response", url };
+    }
+
+    const challengeVendor = await detectBotChallenge(page, response);
+    if (challengeVendor) {
+      const cleared = await waitForChallengeClear(page, 8000);
+      if (!cleared) {
+        console.warn(`Bot challenge blocked ${url} (${challengeVendor})`);
+        return { failed: true, reason: "bot-challenge", vendor: challengeVendor, status: response.status(), url };
+      }
+      // Challenge cleared client-side; re-read the now-real page state.
+      finalUrl = page.url();
+    } else if (!response.ok() && response.status() >= 400) {
+      return { failed: true, reason: "http-error", status: response.status(), url };
+    }
 
     await page.evaluate(axeSource);
 
@@ -220,10 +357,24 @@ async function auditPage(url, serializedChecks, collectLinks = false) {
     };
   } catch (pageError) {
     console.warn(`Error on ${url}: ${pageError.message}`);
-    return null;
+    return { failed: true, reason: "unknown", detail: pageError.message, url };
   } finally {
-    if (netCapture) await netCapture.detach();
-    if (page) await page.close();
+    // The page/target may already be gone (crashed tab, closed window) —
+    // never let cleanup itself mask the real result or crash the request.
+    if (netCapture) {
+      try {
+        await netCapture.detach();
+      } catch (err) {
+        console.warn(`Failed to detach network capture for ${url}: ${err.message}`);
+      }
+    }
+    if (page) {
+      try {
+        await page.close();
+      } catch (err) {
+        console.warn(`Failed to close page for ${url}: ${err.message}`);
+      }
+    }
   }
 }
 
@@ -268,13 +419,15 @@ app.get("/audit", async (req, res) => {
   }));
 
   const pageResults = [];
+  const failures = [];
 
   try {
     if (multiMode) {
       // Audit each provided URL directly — no subpage crawling
       for (const url of urls) {
         const result = await auditPage(url, serializedChecks);
-        if (result) pageResults.push(result.pageResult);
+        if (result?.failed) failures.push(result);
+        else if (result) pageResults.push(result.pageResult);
       }
     } else if (shouldCrawl) {
       // Single URL mode: collect links from homepage and crawl subpages
@@ -292,7 +445,10 @@ app.get("/audit", async (req, res) => {
         // Collect links only from the first successfully audited page
         const isFirstPage = pageResults.length === 0;
         const result = await auditPage(currentUrl, serializedChecks, isFirstPage);
-        if (!result) continue;
+        if (!result || result.failed) {
+          if (result?.failed) failures.push(result);
+          continue;
+        }
 
         if (isFirstPage) {
           for (const link of result.links) {
@@ -309,76 +465,155 @@ app.get("/audit", async (req, res) => {
     } else {
       // Single URL, crawling disabled: audit just that page
       const result = await auditPage(urls[0], serializedChecks);
-      if (result) pageResults.push(result.pageResult);
+      if (result?.failed) failures.push(result);
+      else if (result) pageResults.push(result.pageResult);
     }
+
+    const failureDetails = failures.map(({ url, reason, status, vendor, detail }) => ({
+      url,
+      reason,
+      status,
+      vendor,
+      detail,
+    }));
 
     if (pageResults.length === 0) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Failed to load the provided URL(s). The site may be blocking automated browsers or redirecting unexpectedly.",
+      const botBlocked = failures.find((f) => f.reason === "bot-challenge");
+      const message = botBlocked
+        ? `${botBlocked.vendor} blocked this scan with a bot-detection challenge` +
+          (botBlocked.status ? ` (HTTP ${botBlocked.status})` : "") +
+          `. This can happen even to real visitors' automated tools. Try running the scan again in a few minutes, ` +
+          `or ask the site owner to allowlist this server for automated accessibility testing.`
+        : "Failed to load the provided URL(s). The site may be blocking automated browsers or redirecting unexpectedly.";
+
+      return res.status(400).json({ success: false, message, failures: failureDetails });
+    }
+
+    // Some URLs may have failed (e.g. bot-blocked) even though others
+    // succeeded — still surface those so the frontend can offer the
+    // manual-scan fallback for just the ones that need it.
+    const reportInfo = saveReport(pageResults, multiMode ? urls : urls[0]);
+    res.json({ success: true, ...reportInfo, failures: failureDetails });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// ---------- Manual scan fallback ----------
+// For sites whose bot-protection blocks every automated browser we can
+// launch: the user opens the site normally (a real, already-trusted browser
+// session), solves any challenge themselves, then pastes a one-line snippet
+// into DevTools console. That snippet loads this bundle, which runs the same
+// axe-core + custom rules used elsewhere and posts results back for a report.
+app.get("/manual-scan/axe-core.js", (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.type("application/javascript").send(axeSource);
+});
+
+app.get("/manual-scan/bundle.js", (req, res) => {
+  const origin = PUBLIC_BASE_URL || `${req.protocol}://${req.get("host")}`;
+  const serializedChecks = customChecks.map((check) => ({
+    ...check,
+    evaluate: check.evaluate.toString(),
+  }));
+
+  res.set("Access-Control-Allow-Origin", "*");
+  res.type("application/javascript").send(`(function () {
+  var ORIGIN = ${JSON.stringify(origin)};
+  var CHECKS = ${JSON.stringify(serializedChecks)};
+  var RULES = ${JSON.stringify(customRules)};
+
+  function toast(msg, isError) {
+    var el = document.createElement("div");
+    el.textContent = msg;
+    el.style.cssText = "position:fixed;bottom:20px;right:20px;z-index:2147483647;background:" +
+      (isError ? "#b91c1c" : "#111827") + ";color:#fff;padding:12px 16px;border-radius:8px;" +
+      "font:14px/1.4 -apple-system,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.3);max-width:340px;";
+    document.body.appendChild(el);
+    return el;
+  }
+
+  var statusEl = toast("Accessibility Checker: scanning this page...");
+
+  function run() {
+    try {
+      var reconstructedChecks = CHECKS.map(function (check) {
+        return Object.assign({}, check, {
+          evaluate: new Function("return (" + check.evaluate + ").apply(this, arguments);"),
+        });
       });
+      window.axe.configure({ checks: reconstructedChecks, rules: RULES });
+      window.axe.run().then(function (results) {
+        return fetch(ORIGIN + "/audit/manual", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ url: location.href, accessibility: results }),
+        });
+      }).then(function (r) { return r.json(); }).then(function (data) {
+        statusEl.remove();
+        if (data && data.success) {
+          var link = toast("Scan complete.");
+          var a = document.createElement("a");
+          a.href = ORIGIN + data.report;
+          a.target = "_blank";
+          a.rel = "noopener";
+          a.textContent = "Open report";
+          a.style.cssText = "display:block;margin-top:6px;color:#93c5fd;font-weight:600";
+          link.appendChild(a);
+        } else {
+          toast("Scan failed: " + (data && data.message ? data.message : "unknown error"), true);
+        }
+      }).catch(function (err) {
+        statusEl.remove();
+        toast("Scan failed: " + err.message, true);
+      });
+    } catch (err) {
+      statusEl.remove();
+      toast("Scan failed: " + err.message, true);
     }
+  }
 
-    fs.mkdirSync(REPORTS_DIR, { recursive: true });
+  if (window.axe) {
+    run();
+  } else {
+    fetch(ORIGIN + "/manual-scan/axe-core.js")
+      .then(function (r) { return r.text(); })
+      .then(function (code) {
+        (0, eval)(code);
+        run();
+      })
+      .catch(function (err) {
+        statusEl.remove();
+        toast("Could not load axe-core from " + ORIGIN + ": " + err.message, true);
+      });
+  }
+})();`);
+});
 
-    const timestamp = Date.now();
-    let reportName;
-    if (multiMode) {
-      const domains = [
-        ...new Set(
-          urls.map((u) => {
-            try {
-              return new URL(u).hostname.replace(/^www\./, "");
-            } catch {
-              return "unknown";
-            }
-          })
-        ),
-      ];
-      reportName =
-        domains.length <= 2
-          ? domains.join("+")
-          : `${domains[0]}+${domains.length - 1}more`;
-    } else {
-      reportName = new URL(urls[0]).hostname.replace(/^www\./, "");
+app.options("/audit/manual", (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type");
+  res.sendStatus(204);
+});
+
+app.post("/audit/manual", express.json({ limit: "20mb" }), (req, res) => {
+  res.set("Access-Control-Allow-Origin", "*");
+  try {
+    const { url, accessibility } = req.body || {};
+    if (!url || !accessibility) {
+      return res.status(400).json({ success: false, message: "Missing url or accessibility results" });
     }
-
-    const jsonFilename = `${reportName}.json`;
-    const htmlFilename = `${reportName}.html`;
-
-    const combinedReport = {
-      requestedUrl: multiMode ? urls : urls[0],
-      timestamp,
-      pages: pageResults,
+    const pageResult = {
+      url,
+      finalUrl: url,
+      accessibility,
+      network: { summary: null, requests: [] },
+      console: [],
     };
-
-    fs.writeFileSync(
-      path.join(REPORTS_DIR, jsonFilename),
-      JSON.stringify(combinedReport, null, 2)
-    );
-
-    const html = buildHtmlReport(combinedReport, CUSTOM_RULE_IDS);
-    fs.writeFileSync(path.join(REPORTS_DIR, htmlFilename), html);
-
-    const totalViolations = pageResults.reduce((sum, p) => sum + (p.accessibility.violations || []).length, 0);
-    const totalPasses    = pageResults.reduce((sum, p) => sum + (p.accessibility.passes    || []).length, 0);
-    const customRuleIdSet = new Set(customRules.map((r) => r.id));
-    const totalCustom = pageResults.reduce(
-      (sum, p) => sum + (p.accessibility.violations || []).filter((v) => customRuleIdSet.has(v.id)).length,
-      0
-    );
-
-    res.json({
-      success: true,
-      pagesScanned: pageResults.length,
-      violations: totalViolations,
-      customRuleViolations: totalCustom,
-      passes: totalPasses,
-      report: `/reports/${htmlFilename}`,
-      reportJson: `/reports/${jsonFilename}`,
-    });
-
+    const reportInfo = saveReport([pageResult], url);
+    res.json({ success: true, ...reportInfo });
   } catch (error) {
     console.error(error);
     res.status(500).json({ success: false, error: error.message });
@@ -401,6 +636,7 @@ async function start() {
     headless: true,
     executablePath: chromeExecutablePath,
     ignoreHTTPSErrors: true,
+    ignoreDefaultArgs: ["--enable-automation"],
     args: [
       "--headless=new",
       "--window-position=-32000,-32000",
@@ -435,7 +671,6 @@ async function start() {
       "--disable-speech-api",
       "--disable-sync",
       "--disable-translate",
-      "--disable-webgl",
       "--hide-scrollbars",
       "--metrics-recording-only",
       "--mute-audio",

@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: accessibility-checker
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: AUTO_OPEN_BROWSER
+        value: "false"
+      # Only needed if you're behind a custom domain/CDN where Render's
+      # forwarded Host header doesn't already reflect the public URL.
+      - key: PUBLIC_BASE_URL
+        sync: false

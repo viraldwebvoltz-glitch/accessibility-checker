@@ -1,0 +1,8 @@
+node_modules
+reports
+.git
+.gitignore
+.env
+.env.*
+.chrome-profile-interactive
+*.log
