@@ -31,7 +31,120 @@ const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/+$/, "") 
 // scheme the app is actually listening on (usually plain http internally).
 app.set("trust proxy", true);
 
-let browser;
+// ---------- Browser lifecycle ----------
+// Chrome is launched lazily on the first audit request and reused for as
+// long as audits keep arriving. Once nothing is in flight, it's closed
+// after a short idle window so the process doesn't sit there holding
+// memory between scans — the launch cost (~1-2s) is paid again on the
+// next request instead.
+const BROWSER_IDLE_TIMEOUT_MS = 60 * 1000;
+
+let browser = null;
+let browserLaunchPromise = null;
+let browserIdleTimer = null;
+let activeAudits = 0;
+
+async function launchBrowser() {
+  const chromeExecutablePath = getChromeExecutablePath();
+  return puppeteer.launch({
+    headless: true,
+    executablePath: chromeExecutablePath,
+    ignoreHTTPSErrors: true,
+    ignoreDefaultArgs: ["--enable-automation"],
+    args: [
+      "--headless=new",
+      "--window-position=-32000,-32000",
+      "--window-size=1280,800",
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-gpu",
+      "--disable-software-rasterizer",
+      "--no-zygote",
+      "--renderer-process-limit=1",
+      "--js-flags=--max-old-space-size=512",
+      "--disk-cache-size=0",
+      "--media-cache-size=0",
+      "--force-color-profile=srgb",
+      "--disable-background-networking",
+      "--disable-background-timer-throttling",
+      "--disable-backgrounding-occluded-windows",
+      "--disable-breakpad",
+      "--disable-client-side-phishing-detection",
+      "--disable-component-update",
+      "--disable-default-apps",
+      "--disable-domain-reliability",
+      "--disable-extensions",
+      "--disable-features=AudioServiceOutOfProcess,TranslateUI,Translate",
+      "--disable-hang-monitor",
+      "--disable-ipc-flooding-protection",
+      "--disable-notifications",
+      "--disable-popup-blocking",
+      "--disable-print-preview",
+      "--disable-renderer-backgrounding",
+      "--disable-speech-api",
+      "--disable-sync",
+      "--disable-translate",
+      "--hide-scrollbars",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--no-default-browser-check",
+      "--no-first-run",
+      "--no-pings",
+      "--password-store=basic",
+      "--use-mock-keychain",
+      "--safebrowsing-disable-auto-update",
+      "--log-level=3",
+    ],
+  });
+}
+
+// Returns the shared browser instance, launching it on first use.
+// Concurrent callers during a cold launch all await the same in-flight
+// promise instead of racing to launch multiple Chrome processes.
+async function getBrowser() {
+  if (browser?.connected) return browser;
+  if (browserLaunchPromise) return browserLaunchPromise;
+
+  browserLaunchPromise = launchBrowser()
+    .then((b) => {
+      browser = b;
+      return b;
+    })
+    .finally(() => {
+      browserLaunchPromise = null;
+    });
+  return browserLaunchPromise;
+}
+
+// Call around any block of work that needs the browser. Cancels any
+// pending idle-shutdown while work is in flight, and schedules one once
+// the last piece of work finishes.
+function acquireBrowserSlot() {
+  activeAudits++;
+  if (browserIdleTimer) {
+    clearTimeout(browserIdleTimer);
+    browserIdleTimer = null;
+  }
+}
+
+function releaseBrowserSlot() {
+  activeAudits = Math.max(0, activeAudits - 1);
+  if (activeAudits > 0 || !browser) return;
+
+  browserIdleTimer = setTimeout(async () => {
+    browserIdleTimer = null;
+    if (activeAudits > 0 || !browser) return;
+    const toClose = browser;
+    browser = null;
+    try {
+      await toClose.close();
+      console.log("Closed idle browser instance to free memory.");
+    } catch (err) {
+      console.warn(`Error closing idle browser: ${err.message}`);
+    }
+  }, BROWSER_IDLE_TIMEOUT_MS);
+}
 
 function getChromeExecutablePath() {
   const candidates = [
@@ -142,7 +255,9 @@ function clearReportsOnBoot() {
 function cleanupOldReports() {
   if (!fs.existsSync(REPORTS_DIR)) return;
 
-  const maxAgeMs = 24 * 60 * 60 * 1000;
+  // A report deletes itself as soon as it's downloaded; this only catches
+  // ones that never get downloaded at all.
+  const maxAgeMs = 10 * 60 * 1000;
   const now = Date.now();
 
   for (const file of fs.readdirSync(REPORTS_DIR)) {
@@ -274,7 +389,8 @@ async function auditPage(url, serializedChecks, collectLinks = false) {
   const consoleLogs = [];
 
   try {
-    page = await browser.newPage();
+    const activeBrowser = await getBrowser();
+    page = await activeBrowser.newPage();
     await page.setUserAgent(REALISTIC_USER_AGENT);
     await page.setViewport({ width: 1280, height: 800 });
 
@@ -436,6 +552,7 @@ app.get("/audit", async (req, res) => {
   const pageResults = [];
   const failures = [];
 
+  acquireBrowserSlot();
   try {
     if (multiMode) {
       // Audit each provided URL directly — no subpage crawling
@@ -512,6 +629,8 @@ app.get("/audit", async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ success: false, error: error.message });
+  } finally {
+    releaseBrowserSlot();
   }
 });
 
@@ -745,6 +864,13 @@ app.post("/audit/manual", express.json({ limit: "60mb" }), (req, res) => {
   }
 });
 
+// Meant to be pinged periodically (e.g. by an uptime monitor) both to keep
+// a free-tier host from idling the service down and to actually catch a
+// dead Puppeteer browser (crashed Chrome, disconnected CDP session) rather
+// than just confirming the Node process itself is still running.
+// Chrome is launched lazily per-request and closed when idle (see
+// getBrowser()), so browser being absent here is the normal resting state,
+// not a failure — this just confirms the Node process itself is up.
 app.get("/health", (req, res) => {
   res.json({ success: true, status: "ok" });
 });
@@ -771,61 +897,7 @@ async function start() {
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
   clearReportsOnBoot();
 
-  const chromeExecutablePath = getChromeExecutablePath();
-
-  browser = await puppeteer.launch({
-    headless: true,
-    executablePath: chromeExecutablePath,
-    ignoreHTTPSErrors: true,
-    ignoreDefaultArgs: ["--enable-automation"],
-    args: [
-      "--headless=new",
-      "--window-position=-32000,-32000",
-      "--window-size=1280,800",
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--disable-software-rasterizer",
-      "--no-zygote",
-      "--renderer-process-limit=1",
-      "--js-flags=--max-old-space-size=512",
-      "--disk-cache-size=0",
-      "--media-cache-size=0",
-      "--force-color-profile=srgb",
-      "--disable-background-networking",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-      "--disable-breakpad",
-      "--disable-client-side-phishing-detection",
-      "--disable-component-update",
-      "--disable-default-apps",
-      "--disable-domain-reliability",
-      "--disable-extensions",
-      "--disable-features=AudioServiceOutOfProcess,TranslateUI,Translate",
-      "--disable-hang-monitor",
-      "--disable-ipc-flooding-protection",
-      "--disable-notifications",
-      "--disable-popup-blocking",
-      "--disable-print-preview",
-      "--disable-renderer-backgrounding",
-      "--disable-speech-api",
-      "--disable-sync",
-      "--disable-translate",
-      "--hide-scrollbars",
-      "--metrics-recording-only",
-      "--mute-audio",
-      "--no-default-browser-check",
-      "--no-first-run",
-      "--no-pings",
-      "--password-store=basic",
-      "--use-mock-keychain",
-      "--safebrowsing-disable-auto-update",
-      "--log-level=3",
-    ],
-  });
-
-  setInterval(cleanupOldReports, 60 * 60 * 1000);
+  setInterval(cleanupOldReports, 60 * 1000);
 
   app.listen(PORT, () => {
     const url = `http://localhost:${PORT}`;
