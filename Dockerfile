@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Install Google Chrome (stable) plus the shared libraries headless Chrome
 # needs to actually render pages — without these, Chrome fails to launch
@@ -18,8 +18,9 @@ RUN apt-get update \
 
 # We install system Chrome above, so skip Puppeteer's own ~200MB Chromium
 # download — getChromeExecutablePath() in index.js already looks for
-# /usr/bin/google-chrome as a fallback candidate.
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
+# /usr/bin/google-chrome as a fallback candidate. (Puppeteer 23+ renamed
+# this from PUPPETEER_SKIP_CHROMIUM_DOWNLOAD to PUPPETEER_SKIP_DOWNLOAD.)
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV CHROME_BIN=/usr/bin/google-chrome
 ENV NODE_ENV=production
 
