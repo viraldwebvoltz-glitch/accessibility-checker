@@ -2,6 +2,10 @@
  * reportTemplate.js — multi-page accessibility report generator
  */
 
+// Webvoltz favicon, inlined so downloaded standalone reports still show it
+// (sourced from webvoltz.com's own favicon).
+const FAVICON_DATA_URI = "data:image/webp;base64,UklGRgYCAABXRUJQVlA4WAoAAAAQAAAAHwAAHwAAQUxQSIYAAAABcFNtW+t8C4gAA+kCblFYN6ykm/hNcDBwmf6f9OQfs0XEBACAqTuay5eZxtbiteuilB9KGvyLxZ7Lj/m4BuD2RfHiYHvW4MFUsajGuhMdCVSUKWvl8vedtTJp0SQ6Etqkk1rTswaPFv6ocfUA1hf+FV93eHZjlF9IGjxe2ypQ/mam0BoAAFZQOCBaAQAAMAkAnQEqIAAgAD5VIIxFI6IhG/QAOAVEtgBdl+EKBOAKgA6IDrAPQg6Uf9of1yxADrArMeYdxlWmgOXRlMLl1Y38z2sCIG9ZJzf9KolhubyyAAD+//DCtuHk/+OYX5ovoff7vjgn3D4Sv7xo4pTH1V9v6N0bW08L+lh/Iz5d/x7oP42VNQ8lhkP+oTjKnsf+L2/7iy8yKiABdp818CcRAOdOiAuqr811O36pHYxwqpSv7flyctiojVHN7zDAKTnoL62fCrFRK9K9z5DLfq/R4D8ZNPhv9WLOfaL+nrZO6lQuJfBH/UdAOuAa7+KKEeZ2vELz3zTj/+ISTgyXhqnBSe3FU9vnUW+xbNodyyNa3b24pK+mY/pX7PBtMlP/DVKCXUA/2jZW4yl60NOwwP0hNBpWN61Qqv77yngLhmWM9VHxvY31bWMPmjIfDbA7H/OudS+/Bre1AthAAA==";
+
 // ─── WCAG criterion metadata ──────────────────────────────────────────────────
 const WCAG_CRITERIA_MAP = {
   wcag111: { id: "1.1.1", title: "Non-text Content", level: "A", ver: "2.0" },
@@ -910,6 +914,7 @@ function buildHtmlReport(report, customRuleIds) {
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Accessibility Audit — ${escapeHtml(domain)}</title>
+<link rel="icon" type="image/webp" href="${FAVICON_DATA_URI}"/>
 <style>
 :root{
   --bg:#F5F5F5;--surface:#FFFFFF;--border:#E2E4E8;--text:#0D0D0D;--muted:#6B7280;

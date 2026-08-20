@@ -5,6 +5,7 @@ function renderHomePage() {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Accessibility Checker</title>
+<link rel="icon" type="image/webp" href="/favicon.webp"/>
 <style>
   :root{
     --bg:#F5F5F5;--surface:#FFFFFF;--border:#E2E4E8;--text:#0D0D0D;--muted:#6B7280;
@@ -103,7 +104,7 @@ function renderHomePage() {
   .btn-primary:hover{background:#000}
   .btn-secondary{background:var(--surface);color:var(--text);border-color:var(--border)}
   .btn-secondary:hover{border-color:var(--brand-dark)}
-  .json-link{display:inline-block;margin-top:.7rem;font-size:.78rem;color:var(--muted);text-decoration:underline}
+  .download-note{margin:.7rem 0 0;font-size:.78rem;color:var(--muted)}
 
   .error-panel{border-color:#FECACA;background:#FEF2F2}
   .error-panel p{margin:0;font-size:.88rem;color:var(--red)}
@@ -166,10 +167,9 @@ function renderHomePage() {
     </div>
     <div class="stat-grid" id="statGrid"></div>
     <div class="result-actions">
-      <a class="btn-primary" id="viewReportLink" target="_blank" rel="noopener">View full report</a>
-      <a class="btn-secondary" id="downloadReportLink" download>Download report</a>
+      <a class="btn-primary" id="downloadReportLink">Download report</a>
     </div>
-    <a class="json-link" id="downloadJsonLink" download>Download raw JSON</a>
+    <p class="download-note">This link works once — the report is removed from the server right after it downloads.</p>
   </div>
 
   <div class="card error-panel" id="errorPanel" hidden role="alert" tabindex="-1">
@@ -219,9 +219,7 @@ function renderHomePage() {
   var manualScanSnippet = document.getElementById('manualScanSnippet');
   var copySnippetBtn = document.getElementById('copySnippetBtn');
   var statGrid = document.getElementById('statGrid');
-  var viewReportLink = document.getElementById('viewReportLink');
   var downloadReportLink = document.getElementById('downloadReportLink');
-  var downloadJsonLink = document.getElementById('downloadJsonLink');
   var rowTemplate = document.getElementById('urlRowTemplate');
 
   var isScanning = false;
@@ -373,9 +371,7 @@ function renderHomePage() {
       el.innerHTML = '<div class="num">' + s.num + '</div><div class="lbl">' + s.lbl + '</div>';
       statGrid.appendChild(el);
     });
-    viewReportLink.href = data.report;
     downloadReportLink.href = data.report;
-    downloadJsonLink.href = data.reportJson;
     resultPanel.hidden = false;
     resultPanel.focus();
 

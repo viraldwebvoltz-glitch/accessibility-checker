@@ -1,6 +1,7 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const { URL } = require("url");
 const dns = require("dns").promises;
 const net = require("net");
@@ -125,6 +126,18 @@ function normalizePageUrl(rawUrl) {
   }
 }
 
+// ---------- Startup cleanup ----------
+// Every report deletes itself right after being downloaded, so anything
+// still sitting in reports/ at boot was never downloaded (or is left over
+// from before that behavior existed) — there's nothing worth keeping.
+// Clear it on every startup, not just once.
+function clearReportsOnBoot() {
+  fs.mkdirSync(REPORTS_DIR, { recursive: true });
+  for (const file of fs.readdirSync(REPORTS_DIR)) {
+    fs.unlinkSync(path.join(REPORTS_DIR, file));
+  }
+}
+
 // ---------- Cleanup job ----------
 function cleanupOldReports() {
   if (!fs.existsSync(REPORTS_DIR)) return;
@@ -166,13 +179,14 @@ function saveReport(pageResults, requestedUrl) {
     reportName = new URL(requestedUrl).hostname.replace(/^www\./, "");
   }
 
-  const jsonFilename = `${reportName}.json`;
-  const htmlFilename = `${reportName}.html`;
+  // A random token keeps concurrent scans of the same domain from colliding
+  // on disk and makes the download URL unguessable; the human-readable name
+  // is kept as the suggested filename when the browser actually downloads it.
+  const token = crypto.randomBytes(8).toString("hex");
+  const id = `${reportName}-${token}`;
+  const htmlFilename = `${id}.html`;
 
   const combinedReport = { requestedUrl, timestamp, pages: pageResults };
-
-  fs.writeFileSync(path.join(REPORTS_DIR, jsonFilename), JSON.stringify(combinedReport, null, 2));
-
   const html = buildHtmlReport(combinedReport, CUSTOM_RULE_IDS);
   fs.writeFileSync(path.join(REPORTS_DIR, htmlFilename), html);
 
@@ -189,8 +203,9 @@ function saveReport(pageResults, requestedUrl) {
     violations: totalViolations,
     customRuleViolations: totalCustom,
     passes: totalPasses,
-    report: `/reports/${htmlFilename}`,
-    reportJson: `/reports/${jsonFilename}`,
+    // This route streams the file to the client, then deletes it from
+    // disk — each report can only be downloaded once.
+    report: `/reports/${id}/download`,
   };
 }
 
@@ -661,7 +676,7 @@ app.get("/manual-scan/bundle.js", (req, res) => {
           a.href = ORIGIN + data.report;
           a.target = "_blank";
           a.rel = "noopener";
-          a.textContent = "Open report";
+          a.textContent = "Download report";
           a.style.cssText = "display:block;margin-top:6px;color:#93c5fd;font-weight:600";
           link.appendChild(a);
         } else {
@@ -734,11 +749,27 @@ app.get("/health", (req, res) => {
   res.json({ success: true, status: "ok" });
 });
 
-app.use("/reports", express.static(REPORTS_DIR));
+app.use(express.static(path.join(__dirname, "public")));
+
+// Reports are single-shot: each is streamed to the client and then removed
+// from disk, so a scan's output never lingers on the server longer than it
+// takes the user to download it.
+app.get("/reports/:id/download", (req, res) => {
+  const id = path.basename(req.params.id);
+  const htmlPath = path.join(REPORTS_DIR, `${id}.html`);
+  if (!fs.existsSync(htmlPath)) {
+    return res.status(404).send("Report not found — it may have already been downloaded and removed from the server.");
+  }
+  const downloadName = id.replace(/-[0-9a-f]{16}$/, "") + ".html";
+  res.download(htmlPath, downloadName, () => {
+    fs.unlink(htmlPath, () => {});
+  });
+});
 
 // ---------- Startup / shutdown ----------
 async function start() {
   fs.mkdirSync(REPORTS_DIR, { recursive: true });
+  clearReportsOnBoot();
 
   const chromeExecutablePath = getChromeExecutablePath();
 
