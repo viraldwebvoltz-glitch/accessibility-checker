@@ -523,6 +523,7 @@ app.get("/manual-scan/bundle.js", (req, res) => {
   var ORIGIN = ${JSON.stringify(origin)};
   var CHECKS = ${JSON.stringify(serializedChecks)};
   var RULES = ${JSON.stringify(customRules)};
+  var MAX_PAGES = ${JSON.stringify(MAX_CRAWL_PAGES)};
 
   function toast(msg, isError) {
     var el = document.createElement("div");
@@ -535,25 +536,127 @@ app.get("/manual-scan/bundle.js", (req, res) => {
   }
 
   var statusEl = toast("Accessibility Checker: scanning this page...");
+  function status(msg) { statusEl.textContent = msg; }
 
-  function run() {
-    try {
-      var reconstructedChecks = CHECKS.map(function (check) {
-        return Object.assign({}, check, {
-          evaluate: new Function("return (" + check.evaluate + ").apply(this, arguments);"),
-        });
+  function reconstructedChecks() {
+    return CHECKS.map(function (check) {
+      return Object.assign({}, check, {
+        evaluate: new Function("return (" + check.evaluate + ").apply(this, arguments);"),
       });
-      window.axe.configure({ checks: reconstructedChecks, rules: RULES });
-      window.axe.run().then(function (results) {
+    });
+  }
+
+  // Same-origin links + GET form actions on a document, mirroring the
+  // server's one-level-deep crawl so the manual fallback matches it.
+  function sameOriginLinks(doc, origin) {
+    var seen = {};
+    var out = [];
+    function add(raw) {
+      if (!raw) return;
+      try {
+        var u = new URL(raw, origin);
+        if (u.origin !== origin) return;
+        u.hash = "";
+        var key = u.toString().replace(/\\/$/, "");
+        if (seen[key]) return;
+        seen[key] = true;
+        out.push(u.toString());
+      } catch (e) {}
+    }
+    doc.querySelectorAll("a[href]").forEach(function (a) { add(a.getAttribute("href")); });
+    doc.querySelectorAll("form[action]").forEach(function (f) {
+      var method = (f.getAttribute("method") || "get").toLowerCase();
+      if (method === "get") add(f.getAttribute("action"));
+    });
+    return out;
+  }
+
+  // Loads a same-origin URL into a hidden iframe so it inherits this
+  // browser session's cookies (including any solved bot-challenge) without
+  // opening visible tabs/windows.
+  function loadIframe(url, timeoutMs) {
+    return new Promise(function (resolve) {
+      var iframe = document.createElement("iframe");
+      iframe.style.cssText = "position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;left:-9999px;top:-9999px;";
+      var done = false;
+      function finish(result) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        resolve(result);
+      }
+      var timer = setTimeout(function () { iframe.remove(); finish(null); }, timeoutMs);
+      iframe.onload = function () { finish(iframe); };
+      iframe.onerror = function () { iframe.remove(); finish(null); };
+      iframe.src = url;
+      document.body.appendChild(iframe);
+    });
+  }
+
+  // The report only ever shows a pass count, never per-node HTML/selectors
+  // for passing checks — but axe includes full node detail for every pass
+  // by default, which is the single biggest contributor to payload size on
+  // a multi-page crawl. Strip it here (keeping array length so counts stay
+  // correct) rather than raising the body-size limit indefinitely.
+  function trimPassNodeDetail(results) {
+    if (results && Array.isArray(results.passes)) {
+      results.passes = results.passes.map(function (p) {
+        return Object.assign({}, p, { nodes: (p.nodes || []).map(function () { return {}; }) });
+      });
+    }
+    return results;
+  }
+
+  function scanWindow(win, url, axeSourceCode) {
+    win.eval(axeSourceCode);
+    win.axe.configure({ checks: reconstructedChecks(), rules: RULES });
+    return win.axe.run().then(function (results) {
+      return { url: url, finalUrl: win.location.href, accessibility: trimPassNodeDetail(results) };
+    });
+  }
+
+  function run(axeSourceCode) {
+    var pages = [];
+    scanWindow(window, location.href, axeSourceCode)
+      .then(function (topResult) {
+        pages.push(topResult);
+
+        var origin = location.origin;
+        var links = sameOriginLinks(document, origin).filter(function (u) {
+          return u.replace(/\\/$/, "") !== location.href.replace(/\\/$/, "");
+        }).slice(0, MAX_PAGES - 1);
+
+        return links.reduce(function (chain, link, i) {
+          return chain.then(function () {
+            status("Scanning page " + (i + 2) + " of " + (links.length + 1) + "\\u2026");
+            return loadIframe(link, 20000).then(function (iframe) {
+              if (!iframe) return;
+              var win = iframe.contentWindow;
+              if (!win || win.location.origin !== origin) { iframe.remove(); return; }
+              // Remove the iframe only after scanning settles — removing it
+              // while axe is still running mid-flight tears down its window
+              // and leaves the scan hanging forever.
+              return scanWindow(win, link, axeSourceCode)
+                .then(function (result) { pages.push(result); })
+                .catch(function () { /* skip pages we can't script into */ })
+                .then(function () { iframe.remove(); });
+            });
+          });
+        }, Promise.resolve());
+      })
+      .then(function () {
+        status("Submitting results for " + pages.length + " page(s)\\u2026");
         return fetch(ORIGIN + "/audit/manual", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ url: location.href, accessibility: results }),
+          body: JSON.stringify({ requestedUrl: location.href, pages: pages }),
         });
-      }).then(function (r) { return r.json(); }).then(function (data) {
+      })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
         statusEl.remove();
         if (data && data.success) {
-          var link = toast("Scan complete.");
+          var link = toast("Scan complete \\u2014 " + pages.length + " page(s).");
           var a = document.createElement("a");
           a.href = ORIGIN + data.report;
           a.target = "_blank";
@@ -564,30 +667,23 @@ app.get("/manual-scan/bundle.js", (req, res) => {
         } else {
           toast("Scan failed: " + (data && data.message ? data.message : "unknown error"), true);
         }
-      }).catch(function (err) {
-        statusEl.remove();
-        toast("Scan failed: " + err.message, true);
-      });
-    } catch (err) {
-      statusEl.remove();
-      toast("Scan failed: " + err.message, true);
-    }
-  }
-
-  if (window.axe) {
-    run();
-  } else {
-    fetch(ORIGIN + "/manual-scan/axe-core.js")
-      .then(function (r) { return r.text(); })
-      .then(function (code) {
-        (0, eval)(code);
-        run();
       })
       .catch(function (err) {
         statusEl.remove();
-        toast("Could not load axe-core from " + ORIGIN + ": " + err.message, true);
+        toast("Scan failed: " + err.message, true);
       });
   }
+
+  fetch(ORIGIN + "/manual-scan/axe-core.js")
+    .then(function (r) { return r.text(); })
+    .then(function (code) {
+      (0, eval)(code); // defines window.axe for the top-level page
+      run(code);
+    })
+    .catch(function (err) {
+      statusEl.remove();
+      toast("Could not load axe-core from " + ORIGIN + ": " + err.message, true);
+    });
 })();`);
 });
 
@@ -598,21 +694,35 @@ app.options("/audit/manual", (req, res) => {
   res.sendStatus(204);
 });
 
-app.post("/audit/manual", express.json({ limit: "20mb" }), (req, res) => {
+app.post("/audit/manual", express.json({ limit: "60mb" }), (req, res) => {
   res.set("Access-Control-Allow-Origin", "*");
   try {
-    const { url, accessibility } = req.body || {};
-    if (!url || !accessibility) {
-      return res.status(400).json({ success: false, message: "Missing url or accessibility results" });
+    const body = req.body || {};
+    // Accept either a single-page submission ({url, accessibility}) or a
+    // one-level-deep crawl ({requestedUrl, pages: [...]}) from the bundle.
+    let pages = Array.isArray(body.pages) ? body.pages : null;
+    if (!pages && body.url && body.accessibility) {
+      pages = [{ url: body.url, finalUrl: body.url, accessibility: body.accessibility }];
     }
-    const pageResult = {
-      url,
-      finalUrl: url,
-      accessibility,
-      network: { summary: null, requests: [] },
-      console: [],
-    };
-    const reportInfo = saveReport([pageResult], url);
+    if (!pages || pages.length === 0) {
+      return res.status(400).json({ success: false, message: "Missing page results" });
+    }
+
+    const pageResults = pages
+      .filter((p) => p && p.url && p.accessibility)
+      .map((p) => ({
+        url: p.url,
+        finalUrl: p.finalUrl || p.url,
+        accessibility: p.accessibility,
+        network: { summary: null, requests: [] },
+        console: [],
+      }));
+    if (pageResults.length === 0) {
+      return res.status(400).json({ success: false, message: "Missing page results" });
+    }
+
+    const requestedUrl = body.requestedUrl || pageResults[0].url;
+    const reportInfo = saveReport(pageResults, requestedUrl);
     res.json({ success: true, ...reportInfo });
   } catch (error) {
     console.error(error);
