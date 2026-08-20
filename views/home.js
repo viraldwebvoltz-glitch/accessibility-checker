@@ -24,7 +24,7 @@ function renderHomePage() {
   .hdr-title{margin:0;font-size:1.3rem;font-weight:800;letter-spacing:-.02em;color:#fff}
   .hdr-tag{margin:.3rem 0 0;font-size:.85rem;color:#9CA3AF}
 
-  main{max-width:640px;margin:0 auto;padding:1.75rem 1.25rem 3rem}
+  main{max-width:640px;margin:0 auto;padding:1.75rem 1.25rem 0}
 
   .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.5rem;margin-bottom:1.25rem}
 
@@ -189,7 +189,7 @@ function renderHomePage() {
 </main>
 
 <footer>
-  Reports are generated on demand and automatically deleted after 24 hours.
+  Reports are generated on demand and deleted from the server as soon as you download them (or automatically within 10 minutes if you don't).
 </footer>
 
 <template id="urlRowTemplate">
